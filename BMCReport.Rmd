@@ -1,0 +1,610 @@
+---
+title: "Impact of COVID-19 on the Follow-Up Rate of CTLS Screening"
+author: |
+  Yuta Tsukumo, Jinhu Sun, Chang Shi, Mingrui Du \
+  Teaching Fellow: Minh Thu Bui \
+  Faculty Supervisor: Masanao Yajima \
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+header-includes:
+- \usepackage{titling}
+- \usepackage{amsmath}
+- \pretitle{\begin{center}\Huge\bfseries}
+- \posttitle{\end{center}}
+- \preauthor{\begin{center}\Large}
+- \postauthor{\end{center}}
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \fancyfoot[C]{\thepage}
+---
+
+# 1 Project Background
+
+Katrina A. Steiling, Jacqueline Dinh, and Rebecca Scharf are from Boston Medical Center. Our clients' aim is to assess the impact of the COVID-19 pandemic on follow-up rates and timeliness of follow-up CT screening. Also, they are interested in examining patient-related factors (status of medical insurance, smoking status, medical history, medical condition, etc.) associated with non-adherence to follow-up recommendations for lung cancer screening.
+
+Our project is based on a phenomenon observed during the COVID-19 pandemic when The American College of Chest Physicians (CHEST) suggested deferring lung nodule surveillance for a range of patients. CT scans, one of the main methods to monitor patients' conditions and reduce mortality from lung cancer, were to some extent canceled or delayed during the pandemic. To assess the clinical implications of these delays, we aim to examine their impact as well as the associated factors influencing follow-up rates. Our clients have been monitoring CT chest screenings since 2015, and the data set for this research consists of CT lung screening (CTLS) records collected at Boston Medical Center (BMC).
+
+The sample size for the research is 3026, comprising 38 variables. The general timeline for the research is from March 2018 to March 2022. It is divided into three sections: pre-pandemic, peak-pandemic, and post-pandemic. Time for pre-pandemic is from 3/1/2018 to 3/13/2020. Time for peak pandemic is from 3/14/2020 to 6/4/2020. Time for post-peak pandemic is from 6/5/2020 to 3/1/2022. To notice, recording of patients' initial CTLS was concluded on 3/1/2020, and no further records of new patients were included beyond this date. Follow-up records for all patients were collected up until 3/1/2022. Only adult patients data are collected, de-identified before sending to our team.
+
+# 2 Objective
+
+There are three objectives for this project.
+
+The first one is to assess the impact of the COVID-19 pandemic on follow-up rates and timeliness of follow-up screening.
+
+The second one is to examine patient-related factors (demographics, insurance, smoking status, etc.) associated with non-adherence to follow-up recommendations for lung cancer screening.
+
+The third objective is to create a logistic regression model using pandemic timing classification and patient demographics as explanatory variables, with the outcome being whether or not the patient was seen in time. In doing so, a multilevel analysis approach was used to account for the fact that the same patient may be screened more than once.
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+## Preparation
+library(readxl)
+library(tidyverse)
+library(knitr)
+library(stringr)
+library(scales)
+library(dplyr)
+library(MASS)
+library(MuMIn)
+library(rstanarm) # stan_glm
+library(brms) # for binary GLMM. Since our response is binary, It's better using GLMM than lmm
+library(arm) # binned residual plot
+library(performance)
+library(bayesplot)
+library(ggplot2)
+library(sjPlot) #for plotting lmer and glmer mods
+library(sjmisc) 
+library(effects)
+library(sjstats) #use for r2 functions
+opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = "..", fig.width=3, fig.height=2)
+```
+
+# 3 Data Cleaning and Organization
+
+For the data preparation, we first dropped all the missing values in "UID" column. For patients with multiple visits to BMC during the period of interest, their demographic info is recorded only on initial visit. To catch an overall trend of timeliness, missing parts were supplemented accordingly based on UID. Then, we corrected all the typos that exist in the data set. For instance, we correct "Uknown" to "Unknown" in the column "Smoking Status At Time of Initial Scan".
+
+We created dummy variables for specific columns (HTN, MI, CHF, CAD, COPD/Emphysema, FHx of Lung Cancer), replacing "yes" with 1 and other values with 0. A new categorical variable "comorbidity_total" was then created to indicate the total number of these comorbidities, which were then classified into three categories: 0, 1, 2 or more comorbidities.
+
+We need to define timeliness from the given data set using all the variables included. To categorize whether a patient's visit is on time or late, we first created another column called "gap", which calculates the absolute value of the difference between "Months between imaging tests" and "Radiology Recommended Follow Up". We define a visit is: - late: The difference is \>2, - timely: The difference is \<=2.
+
+Patients who did not show up for their screening visit were classified as 'late' as a rule. However, if there was a specific reason for not showing up for the visit (No longer eligible for CTLS, Patient canceled CT appointment, Patient left BMC system, Patient was incarcerated), these patients were excluded from the analysis.
+
+For the medical insurance variable, we reorganized the original data into four categories ("Medicare," "Medicaid," "Private," and "Other") as the clients classified them.
+
+For the race variable, the data were reorganized into White, Black, and Other categories based on the results of client consultations.
+
+For the Lung-RADS variable, we created new categorical variable "LungRADS_3" which classified into three categories: 1, 2, 3 or beyond
+
+```{r, warning=FALSE}
+## Data Reading and Cleaning
+data_orig <- read_xlsx("~/Desktop/AMS/MA676/Consulting/Cleaned_data/240312_covid_ctls_2022_for_mssp.xlsx")
+
+for (i in 1:length(data_orig$`Primary Insurance`)) {
+  if (is.na(data_orig$`Primary Insurance`[i]) && !is.na(data_orig$`Other Insurance`[i])) {
+    data_orig$`Primary Insurance`[i] <- data_orig$`Other Insurance`[i]
+    data_orig$`Other Insurance`[i] <- NA
+  }
+}
+
+# Assign values from the previous visit to patient demographics, etc. that are omitted when the same patient is seen multiple times.
+data_orig <- data_orig |>
+  group_by(UID) |>
+  fill("Gender", "Race", "Ethnicity", "Primary Insurance", "Other Insurance", "Language", "Smoking Status At Time of Initial Scan", "Pack Years", "Years Since Quitting", "Tumor Board", "LNC and/or Thoracic Surgery Referral after index scan", "Biopsy Performed?", "Result of Biopsy", "Cancer Dx Post CTLS" , "Cell Type or Cancer Stage","Deceased", "Days between index scan and death", "HTN", "MI", "CHF", "CAD", "COPD/Emphysema", "FHx of Lung Cancer", .direction = "down")
+```
+
+```{r, warning=FALSE}
+# Change categorical variable classification
+
+# Outcome variable (from three outcomes to binary outcomes)
+data_ed <- data_orig |>
+  mutate(Timeliness2 = ifelse(Timeliness %in% c("late", "absent"), "late", "timely"))
+
+data_ed$Timeli_num <- as.factor(data_ed$Timeli_num)
+
+data_ed <- data_ed |>
+  mutate(Timeli_num2 = ifelse(Timeli_num %in% c("2", "3"), "2", "1"))
+
+# Race (white vs black vs other)
+# table(data_ed$Race)
+data_ed <- data_ed |>
+  mutate(Race = ifelse(Race == "White", Race, ifelse(Race == "Black", Race, "Other")))
+
+# check NA
+# colSums(is.na(data_ed))
+
+```
+
+```{r, warning=FALSE}
+# additional data cleaning
+data_ed$`Other Insurance` <- ifelse(data_ed$`Other Insurance` == 'Unknown', NA, data_ed$`Other Insurance`)
+
+data_ed$Language <- ifelse(data_ed$Language == 'NA', NA, data_ed$Language)
+
+data_ed$`Smoking Status At Time of Initial Scan` <- ifelse(data_ed$`Smoking Status At Time of Initial Scan` == 'Unknown', NA, data_ed$`Smoking Status At Time of Initial Scan`)
+
+data_ed$`Pack Years` <- ifelse(data_ed$`Pack Years` %in% c('Unknown','NA'), NA, data_ed$`Pack Years`)
+
+data_ed$`Years Since Quitting` <- ifelse(data_ed$`Years Since Quitting` == 'Unknown', NA, data_ed$`Years Since Quitting`)
+data_ed$`Years Since Quitting` <- ifelse(data_ed$`Years Since Quitting` == '5 months', 0.42, data_ed$`Years Since Quitting`)
+
+data_ed$`Date of CTLS` <- ifelse(data_ed$`Date of CTLS` == 'Peak pandemic', 'Peak-pandemic', data_ed$`Date of CTLS`)
+
+data_ed$LungRADS <- ifelse(data_ed$LungRADS %in% c("NA", "Not listed"), NA, data_ed$LungRADS)
+
+data_ed$`Was Follow Up Scan Ordered` <- ifelse(data_ed$`Was Follow Up Scan Ordered` == "Unknown", NA, data_ed$`Was Follow Up Scan Ordered`)
+
+data_ed$`Date Follow Up Imaging Obtained` <- ifelse(data_ed$`Date Follow Up Imaging Obtained` == "Peak pandemic", "Peak-pandemic", data_ed$`Date Follow Up Imaging Obtained`)
+
+data_ed$`Primary reason scan was late, not ordered, or not performed`<- ifelse(data_ed$`Primary reason scan was late, not ordered, or not performed` == "NA", NA, data_ed$`Primary reason scan was late, not ordered, or not performed`)
+
+data_ed$`Secondary reason scan was late, not ordered, or not performed (if applicable)`<- ifelse(data_ed$`Secondary reason scan was late, not ordered, or not performed (if applicable)` %in% c("NA", "nA"), NA, data_ed$`Secondary reason scan was late, not ordered, or not performed (if applicable)`)
+
+data_ed$`Result of that follow up scan (CT, PET, or CTLS) (from the CT, PET or CTLS report)`<- ifelse(data_ed$`Result of that follow up scan (CT, PET, or CTLS) (from the CT, PET or CTLS report)` == "NA", NA, data_ed$`Result of that follow up scan (CT, PET, or CTLS) (from the CT, PET or CTLS report)`)
+
+data_ed$`Tumor Board` <- ifelse(data_ed$`Tumor Board` == "no", "No", data_ed$`Tumor Board`)
+
+data_ed$`LNC and/or Thoracic Surgery Referral after index scan` <- ifelse(data_ed$`LNC and/or Thoracic Surgery Referral after index scan` == "no", "No", data_ed$`LNC and/or Thoracic Surgery Referral after index scan`)
+
+data_ed$`Biopsy Performed?` <- ifelse(data_ed$`Biopsy Performed?` %in% c("no", "NO"), "No", ifelse(data_ed$`Biopsy Performed?` == "yes", "Yes", data_ed$`Biopsy Performed?`))
+
+data_ed$`Days between index scan and first biopsy` <- ifelse(data_ed$`Days between index scan and first biopsy` == "NA", NA, data_ed$`Days between index scan and first biopsy`)
+
+data_ed$`Days between LungRADS4 scan and first biopsy` <- ifelse(data_ed$`Days between LungRADS4 scan and first biopsy` == "NA", NA, data_ed$`Days between LungRADS4 scan and first biopsy`)
+
+data_ed$`Result of Biopsy` <- ifelse(data_ed$`Result of Biopsy` %in% c("NA", "nA", "Na"), NA, data_ed$`Result of Biopsy`)
+
+data_ed$`Cancer Dx Post CTLS` <- ifelse(data_ed$`Cancer Dx Post CTLS` %in% c("no", "NO"), "No", ifelse(data_ed$`Cancer Dx Post CTLS` == "yes", "Yes", data_ed$`Cancer Dx Post CTLS`))
+
+data_ed$`Cell Type or Cancer Stage` <- ifelse(data_ed$`Cell Type or Cancer Stage` %in% c("no", "NO", "nO", "No", "unknown"), NA, ifelse(data_ed$`Cell Type or Cancer Stage` == "IA", "Ia", ifelse(data_ed$`Cell Type or Cancer Stage` == "IB", "Ib", ifelse(data_ed$`Cell Type or Cancer Stage` == "IIB", "IIb", ifelse(data_ed$`Cell Type or Cancer Stage` == "IVA", "IVa", ifelse(data_ed$`Cell Type or Cancer Stage` == "IVB", "IVb",  data_ed$`Cell Type or Cancer Stage`))))))
+
+data_ed$Deceased <- ifelse(data_ed$Deceased %in% c("no", "NO", "nO"), "No", ifelse(data_ed$Deceased == "yes", "Yes", ifelse(data_ed$Deceased == "Unknown", NA, data_ed$Deceased)))
+```
+
+```{r, warning=FALSE}
+# Exclude cases where the patient with specific reasons (revised after client meeting on 3/1).
+data_ed <- data_ed |>
+  filter(!(Timeliness == "absent" & `Primary reason scan was late, not ordered, or not performed` %in% c("4 - No longer eligible for CTLS", "6 - Patient cancelled",  "12 - Patient left BMC", "16 - Incarcerated")))
+```
+
+```{r}
+# correct class
+data_ed<- data_ed |>
+  mutate_at(vars(Gender, Race, Ethnicity, `Primary Insurance`, `Other Insurance`, Language, `Smoking Status At Time of Initial Scan`, `Date of CTLS`, LungRADS, `Notified of Results`, `Was Follow Up Scan Ordered`, `Date Follow Up Imaging Obtained`, `Primary reason scan was late, not ordered, or not performed`, `Secondary reason scan was late, not ordered, or not performed (if applicable)`, `Tumor Board`, `LNC and/or Thoracic Surgery Referral after index scan`, `Cancer Dx Post CTLS`, `Cell Type or Cancer Stage`, Deceased, Timeliness, Timeliness2, CovidRelated, LanguageCategory1, `Radiology Recommended Due Date Estimate`), as.factor)
+```
+
+```{r, warning=FALSE}
+# reclassify the LungRADS category
+data_ed2 <- data_ed |>
+  mutate(LungRADS_3 = ifelse(LungRADS == "1", "1", 
+                                 ifelse(LungRADS == "2", "2", "3 and beyond")))
+```
+
+```{r, warning=FALSE}
+# create new variables of total number of comorbidity 
+data_ed2$comorbidity_total <- rowSums(data_ed2[, c('HTN', 'MI', 'CHF', 'CAD', 'COPD/Emphysema')])
+
+data_ed2$comorbidity_total <- ifelse(data_ed2$comorbidity_total > 1, "2 or more",
+                                    data_ed2$comorbidity_total)
+```
+
+```{r, warning=FALSE}
+# write.csv(data_ed2, "BMC_cleaned.csv", row.names = FALSE)
+```
+
+# 4 Exploratory Data Analysis
+
+```{r, warning=FALSE}
+data <-  read.csv("~/Desktop/AMS/MA676/Consulting/Cleaned_data/BMC_cleaned.csv")
+```
+
+```{r, warning=FALSE}
+data<- data %>% 
+  filter(!is.na(Primary.Insurance))
+
+data<- data %>% 
+  filter(!is.na(LungRADS_3))
+
+data<- data %>% 
+  filter(!is.na(Gender))
+
+```
+
+```{r, warning=FALSE}
+data_filtered <- data %>%
+  filter(Ethnicity != "Declined", Ethnicity != "White")
+```
+
+```{r, warning=FALSE}
+# Adjusting HTN variable to be a factor with clear labels
+data$HTN <- factor(data$HTN, levels=c(0, 1), labels=c("No HTN", "HTN"))
+data<- data %>% 
+  filter(!is.na(HTN))
+
+ggplot(data, aes(x=HTN, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="HTN Distribution by Timely",
+       fill = "Timely")
+
+```
+
+This chart shows the distribution of hypertension (HTN) status among participants in the data set, differentiated according to the timeliness of their lung cancer screening. The Timely field represents the timeliness of lung cancer screening, with possible values including "timely" and "not timely" to reflect the relative speed or delay in participants receiving screening.
+
+In the chart, different colors represent different categories of screening timeliness, providing a perspective to see if there is a clear pattern of association between hypertension status and lung cancer screening timeliness.
+
+```{r, warning=FALSE}
+data$MI <- factor(data$MI, levels=c(0, 1), labels=c("No MI", "MI"))
+data<- data %>% 
+  filter(!is.na(MI))
+
+ggplot(data, aes(x=MI, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="MI Distribution by Timely",
+       fill = "Timely")
+```
+
+This chart shows the distribution of myocardial infarction (MI) status among participants, and disaggregated according to the timeliness of lung cancer screening. By observing the distribution of timeliness in different MI states, the possible influence of myocardial infarction status on the timeliness of lung cancer screening can be analyzed. Similarly, this analysis helps to understand how cardiovascular health affects patient acceptance and timeliness of lung cancer screening.
+
+```{r, warning=FALSE}
+data$CHF <- factor(data$CHF, levels=c(0, 1), labels=c("No CHF", "CHF"))
+data<- data %>% 
+  filter(!is.na(CHF))
+
+ggplot(data, aes(x=CHF, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="CHF Distribution by Timely",
+       fill = "Timely")
+```
+
+The chart is further broken down into distributions classified by screening timeliness by presence or absence of congestive heart failure (CHF). The relationship between congestive heart failure as a serious heart condition and the timeliness of lung cancer screening reveals behavioral patterns in patients with severe heart disease with respect to lung cancer screening and may point to the need for adjustments to specific medical needs and screening strategies.
+
+```{r, warning=FALSE}
+data$CAD <- factor(data$CAD, levels=c(0, 1), labels=c("No CAD", "CAD"))
+data<- data %>% 
+  filter(!is.na(CAD))
+
+ggplot(data, aes(x=CAD, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="CAD Distribution by Timely",
+       fill = "Timely")
+```
+
+This chart focuses on the distribution of coronary artery disease (CAD), divided according to the timeliness of lung cancer screening. By comparing the differences in the timeliness of lung cancer screening among people with or without coronary artery disease, we can explore the impact of cardiovascular health status on lung cancer screening behavior.
+
+```{r, warning=FALSE}
+data$`COPD.Emphysema` <- factor(data$`COPD.Emphysema`, levels=c(0, 1), labels=c("No COPD/Emphysema ", "COPD/Emphysema "))
+data<- data %>% 
+  filter(!is.na(`COPD.Emphysema`))
+
+ggplot(data, aes(x=`COPD.Emphysema`, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="COPD/Emphysema Distribution by Timely",
+       x = "COPD / Emphysema",
+       fill = "Timely")
+```
+
+The chart shows that participants with COPD/ emphysema status may differ in receiving "timely" versus "untimely" lung cancer screening. This analysis has important implications for understanding the specific needs of patients with COPD/ emphysema in lung cancer risk management and screening engagement. Since patients with COPD and emphysema are often at higher risk of lung cancer, it is especially important to ensure that these groups have access to timely lung cancer screening.
+
+This analysis highlights the importance of considering patients with serious respiratory conditions such as COPD/ emphysema when designing and implementing targeted lung cancer screening strategies. By identifying differences in screening behavior and timeliness in these patient populations, public health officials and healthcare providers can more effectively target and intervene to improve screening coverage and reduce lung cancer mortality.
+
+```{r, warning=FALSE}
+data<- data %>% 
+  filter(!is.na(`comorbidity_total`))
+
+ggplot(data, aes(x=`comorbidity_total`, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Total Number of Comorbidity by Timley",
+       x = "Total Number of Comorbidity",
+       fill = "Timely")
+
+```
+
+Finally, the bar chart shows the relationship between the　the total number of the five comorbidities shown above(0, 1, and 2 or more) and Timely. From this bar chart, it can be read that the ratio of timely to late tends to increase with the number of comorbidities.
+
+These analyses provide a way to understand the relationship between different health conditions (hypertension, myocardial infarction, congestive heart failure, coronary artery disease, and COPD/Emphysema) and the timeliness of lung cancer screening. By identifying which patients with medical conditions are more likely to have delayed or timely lung cancer screening, healthcare providers can better tailor interventions to improve screening rates and timeliness in high-risk groups.
+
+```{r, warning=FALSE}
+# Gender Distribution by Timeliness
+ggplot(data, aes(x=Gender, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Gender Distribution by Timely",
+       fill = "Timely")
+```
+
+As can be seen from the chart, there are some differences between different genders in receiving lung cancer screening in a timely manner. Such differences may be caused by a variety of factors, including but not limited to differences in perceptions of health risks, differences in access to healthcare resources, and underlying socioeconomic factors.
+
+This analysis is critical for the design of public health strategies and lung cancer screening programs, as it reveals areas that may require special attention to improve screening rates for specific gender groups. By identifying and understanding the factors that contribute to these differences, healthcare providers and policymakers can design more targeted interventions to ensure that all populations receive lung cancer screening in a timely manner.
+
+```{r, warning=FALSE}
+ggplot(data, aes(x=Race, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Racial Distribution by Timely",
+       fill = "Timely")
+
+```
+
+By analyzing the differences in timely access to lung cancer screening among different ethnic groups, we can observe that certain ethnic groups may face more challenges in timely access to lung cancer screening. These differences can be influenced by a variety of factors, including socioeconomic status, accessibility of the health care system, level of health education, and cultural and social beliefs.
+
+This analysis is critical for public health officials and health care providers because it identifies areas where special measures may be needed to increase participation and timeliness of lung cancer screening in certain ethnic groups. Understanding the root causes of the differences in timeliness can help develop more effective strategies and interventions to ensure that all populations have equitable access to timely and high-quality lung cancer screening services.
+
+```{r, warning=FALSE}
+ggplot(data_filtered , aes(x=Ethnicity, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Ethnic Distribution by Timely",
+       fill = "Timely")
+```
+
+This chart shows the distribution of Timely lung cancer screening among participants of different ethnic backgrounds. By comparing the distribution of different ethnic groups in the "timely" and "untimely" screening categories, we can gain insight into the potential impact of ethnic background on lung cancer screening acceptance and timeliness. The chart reveals that there may be significant differences among ethnic groups in the timeliness of lung cancer screening, which may be related to culture, socioeconomic factors, health awareness, and access to medical resources.
+
+```{r, warning=FALSE}
+ggplot(data, aes(x=Primary.Insurance, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Primary Insurance Distribution by Timely",
+       x = "Primay Insurance",
+       fill = "Timely") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+This chart shows the distribution of the timeliness of participants' lung cancer screening by major insurance type. Insurance type, as a measure of socioeconomic status and accessibility of healthcare services, is important for understanding the differences in participation and timeliness of lung cancer screening among different groups. As can be observed from the chart, there are differences in the timeliness of screening among participants with different insurance types, which may reflect the influence of factors such as insurance coverage, insurance reimbursement policies, and personal affordability on lung cancer screening behavior.
+
+Both analyses provide insight into how coverage and timeliness of lung cancer screening can be improved by considering ethnic background and insurance type. Identifying groups with differences in screening timeliness can help public health officials and policymakers design targeted interventions to ensure that all populations have equal access to timely and effective lung cancer screening services.
+
+```{r, warning=FALSE}
+data$Pack = cut(data$`Pack.Years`, breaks=seq(from = min(data$`Pack.Years`, na.rm = TRUE), to = max(data$`Pack.Years`, na.rm = TRUE), by = 30), include.lowest = TRUE, right = FALSE)
+data<- data %>% 
+  filter(!is.na(Pack))
+
+ggplot(data, aes(x=Pack, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Pack Years Distribution by Timely", x="Pack year", y="Count") +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+```
+
+As can be seen from the chart, there may be differences in the pack-year distribution among participants in different timeliness screening categories (i.e., "timely" and "not timely"). This difference helps us understand how long-term smoking behavior affects the timeliness of an individual's lung cancer screening. For example, if individuals with high smoking pack years had higher rates of "late" screening, this could hint at a delay in high-risk smoking groups actually getting screened.
+
+This analysis highlights the importance of considering smoking history when designing targeted lung cancer screening promotion measures. Understanding how smoking behavior affects the timeliness of screening can help public health experts and medical providers more effectively target and intervene in high-risk groups to improve participation and timeliness of lung cancer screening.
+
+```{r, warning=FALSE}
+ggplot(data, aes(x=LungRADS_3, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Lung-RADS Classification by Timely",
+       x = "Lung-RADS",
+       fill = "Timely")
+
+```
+
+In this chart, we can see the different Lung RADS scoring categories and their corresponding counts. Lung RADS is a system used to standardize the results of lung CT scans, designed to help radiologists classify the potential risk of malignancy in lung nodules.
+
+The chart shows the number of samples for each Lung RADS category in the dataset. This helps us understand the distribution of lung nodule malignancy risk in the data set, such as which categories are more common and which are less common. This analysis has important implications for evaluating the outcomes of lung cancer screening procedures and for further studies of patients in specific risk categories.
+
+```{r, warning=FALSE}
+ggplot(data, aes(x=Radiology.Recommended.Due.Date.Estimate, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Radiology Recommended Due Date Estimate by Timely",
+       x = "Radiology.Recommended.Due.Date.Estimate",
+       fill = "Timely")
+
+```
+
+The purpose of the analysis of this image was to assess whether the due date of radiology recommendations was related to the timeliness of patients' actual adherence to lung cancer screening recommendations. For example, if patients in the "not in time" category generally show a later due date than those in the "in time" category, this could indicate a correlation between the delay in due date estimates and the delay in patients getting screened.
+
+```{r, warning=FALSE}
+data$AgeCTLS = cut(data$`Age.at.CTLS..by.years.`, breaks=seq(from = min(data$`Age.at.CTLS..by.years.`, na.rm = TRUE), to = max(data$`Age.at.CTLS..by.years.`, na.rm = TRUE), by = 10), include.lowest = TRUE, right = FALSE)
+data<- data %>% 
+  filter(!is.na(AgeCTLS))
+
+ggplot(data, aes(x=AgeCTLS, fill=Timeliness2)) + 
+  geom_bar(position="dodge") +
+  labs(title="Age Distribution at CTLS by Timely", x="Age Group", y="Count") +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+```
+
+As can be observed from the chart, there may be differences in the age distribution of participants in different timeliness categories. This helps us assess how age factors affect an individual's decision and timeliness to undergo lung cancer screening. For example, if younger or older participants were high in the "late" screening category, this could indicate barriers or specific needs for a particular age group in getting screened for lung cancer.
+
+This analysis has important implications for the design of public health strategies and lung cancer screening programs, as it reveals specific interventions that may need to be taken for different age groups to ensure that people of all ages receive lung cancer screening in a timely manner. By understanding the relationship between age and the timeliness of lung cancer screening, healthcare providers and policymakers can more effectively design and implement strategies to improve lung cancer screening coverage and effectiveness.
+
+# 5 Modeling
+
+```{r, warning=FALSE}
+Datam <- read.csv("~/Desktop/AMS/MA676/Consulting/Cleaned_data/BMC_cleaned.csv")
+```
+
+```{r, warning=FALSE}
+#factorize
+Datam <- Datam %>%
+  mutate(across(c("Primary.Insurance","Other.Insurance", "Gender", "Race", "Ethnicity", "Smoking.Status.At.Time.of.Initial.Scan", "Radiology.Recommended.Follow.Up", "Notified.of.Results" , "Date.of.CTLS", "Was.Follow.Up.Scan.Ordered", "Deceased", "HTN", "MI", "CHF", "CAD","COPD.Emphysema", "CovidRelated", "Biopsy.Performed.", "LungRADS_3", "comorbidity_total", "LanguageCategory1", "Radiology.Recommended.Due.Date.Estimate"), factor)) 
+Datam$Timeli_num3 <- Datam$Timeli_num2 - 1
+Datam$Radiology.Recommended.Due.Date.Estimate=factor(Datam$Radiology.Recommended.Due.Date.Estimate,
+levels=c("Pre-pandemic", "Peak pandemic","Post-peak pandemic" ))
+Datam <- Datam %>%
+  rename(`Recommended.Due.Date.Est` = "Radiology.Recommended.Due.Date.Estimate", 
+         `Lung.RADS` = "LungRADS_3",
+         `Languages`  = "LanguageCategory1")
+```
+
+```{r}
+##################################################### Re-level and etc. ############################################################
+
+Datam$Primary.Insurance <- relevel(Datam$Primary.Insurance, ref = "Private")
+Datam$Recommended.Due.Date.Est <- relevel(Datam$Recommended.Due.Date.Est, ref = "Pre-pandemic")
+Datam$Race <- relevel(Datam$Race, ref = "White")
+Datam$Languages <- relevel(Datam$Languages, ref = "English")
+
+
+#Datam$comorbidity_total <- as.character(Datam$comorbidity_total)
+#Datam$comorbidity_total[Datam$comorbidity_total != "0"] <- "1 and more"
+#Datam$comorbidity_total <- as.factor(Datam$comorbidity_total)
+
+
+Datam$Lung.RADS <- as.character(Datam$Lung.RADS)
+Datam$Lung.RADS[Datam$Lung.RADS == "1" | Datam$Lung.RADS == "2"] <- "1 and 2"
+Datam$Lung.RADS <- as.factor(Datam$Lung.RADS)
+```
+
+```{r, warning=FALSE}
+Datam$Timeli_num3 <- factor(Datam$Timeli_num3, levels = c(0, 1), labels = c("Timely", "Late"))
+table(Datam$`Recommended.Due.Date.Est`,Datam$Timeli_num3)
+ggplot(Datam)+geom_jitter()+
+  aes(x=`Recommended.Due.Date.Est`,y=Timeli_num3) 
+```
+
+In the visualized distribution, it's clear that the number of patients arrived on time for follow-up lung screening dropped drastically, a discrepancy that was not evident pre-pandemic. After pandemic peak, there was a recovery in timeliness, yet a certain percentage of patients continued to be late.
+
+Mixed effect model helps on analyzing data with multiple levels and random effects, offering flexibility to model complex correlations within data, such as varying slopes or intercepts among different groups. Here we select glmer() for binomial outcomes ('timely' or 'late') using logit as link function:
+
+```{=latex}
+\begin{align*}
+\text{Timeliness} &\sim \text{Recommended.Due.Date.Estimate} + \text{Primary.Insurance} + \text{Gender} \\
+&\quad + \text{Race} + \text{scale(Age.at.CTLS.by.years.)} + \text{scale(Pack.Years)} \\
+&\quad + \text{Languages} + (1|\text{UID})
+\end{align*}
+```
+We first fit a mixed-effect model using only demographic information: Primary Insurance, Gender, Race, Age by Years, Pack Years, Language.
+
+```{r, warning=FALSE}
+set.seed(123)
+model <- glmer(Timeli_num3 ~ (1|UID) + `Recommended.Due.Date.Est` + Primary.Insurance
+               + Gender + Race + scale(Age.at.CTLS..by.years.) + scale(Pack.Years) 
+             + `Languages` 
+             , data = Datam, family = binomial(link = "logit"),
+             control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000)))
+#+ LungRADS_3 + comorbidity_total
+```
+
+```{r, warning=FALSE}
+sjPlot::plot_model(model,
+                   show.values=TRUE, show.p=TRUE,
+                   title="Effect of Demographic Information on Timeliness")
+```
+
+(Baseline for Recommended Due Date Est = "pre-pandemic" Baseline for private insurance = "private" Baseline for Gender = "female" Baseline for Race = "white" Baseline for Languages = "English" )
+
+Each variable has one level designated as the baseline to prevent multicollinearity. The coefficients of the remaining categories are presented in the result, reflecting comparisons with the baseline level. For each time period, the odds of being late during the peak pandemic is 8.03 times higher than during the pre-pandemic. Similarly, the odds of being late during the post-peak pandemic is 1.63 times higher than that during pre-pandemic, holding everything else constant. From the plot, we can also see that age at CTLS by years and pack years are also significant, contributing to the tendency to be late for the follow-up CT lung scan. However, from the binned residual plot(see appendix), which is often used as an assessment of the model performance, we see that there are outliers that lie outsides of the predicted area created by the two grey lines. Another concern is coefficients of *Languages* are spread across a wide range thus we cannot ascertain the impact of this variable to timeliness. Hence, this might not be the best model.
+
+Next, we add health-related information into the model, including LungRADS and comorbidity. So the equation becomes:
+
+$$
+\begin{align*}
+\text{Timeliness} &\sim \text{Recommended.Due.Date.Est} + \text{Primary.Insurance} \\
+                  &\quad + \text{Gender} + \text{Race} + \text{scale(Age.at.CTLS.by.years.)} \\
+                  &\quad + \text{scale(Pack.Years)} + \text{Languages} + \text{Lung.RADS} \\
+                  &\quad + \text{comorbidity_total} + (1|\text{UID})
+\end{align*}
+$$
+
+```{r, warning=FALSE}
+set.seed(123)
+model_health <- glmer(Timeli_num3 ~ (1|UID) + 
+                        `Recommended.Due.Date.Est` + Primary.Insurance
+               + Gender + Race + scale(Age.at.CTLS..by.years.) + scale(Pack.Years) 
+             + `Languages` + `Lung.RADS` + comorbidity_total
+             , data = Datam, family = binomial(link = "logit"),
+             control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000)))
+```
+
+```{r, warning=FALSE}
+sjPlot::plot_model(model_health,
+                   show.values=TRUE, show.p=TRUE,
+                   title="Effect of Demographic and Health-related Information on Timeliness")
+```
+
+(Baseline for Recommended Due Date Est = "pre-pandemic" Baseline for private insurance = "private" Baseline for Gender = "female" Baseline for Race = "white" Baseline for Languages = "English" Baseline for Lung RADS = "1 and 2" Baseline for comorbidity total = "0")
+
+In this model, for different periods when radiology due date was recommended, the odds of being late during peak-pandemic is 7.61 times higher than that during pre-pandemic. Keeping other variables constant, the odds of being late during the post-peak pandemic is 1.37 times higher compared to pre-pandemic phase. As shown in the odds ratio plot, Lung RADs and comorbidity total are labelled as significant factors of being late for follow-up CTLS. LungRADS with value "3 and beyond" is 0.48 times higher than LungRADS with value "1 and 2" in the odds of being late for the follow-up CT lung scan. Also, comorbidity with value 1 is 0.76 times higher versus comorbidity with value 0. Same goes to comorbidity with value 2 or more, it is 0.74 times versus comorbidity with value 0. The binned residual plot(in appendix) has an improved performance with outlier reduction and increasing randomness of scattered points.
+
+Finally, we employ the identical model used in the previous subsection within a Bayesian framework to deepen interpretation and enhance accuracy:
+
+```{r, warning=FALSE, include = FALSE}
+set.seed(123)
+model3 <- brm(Timeli_num3 ~ (1|UID) 
+              + `Recommended.Due.Date.Est` + Primary.Insurance 
+             + Gender + Race + scale(Age.at.CTLS..by.years.) 
+             + scale(Pack.Years) + `Languages` + 
+             `Lung.RADS` + comorbidity_total,
+             data = Datam, family = bernoulli(), 
+             iter = 4000,  # Increase from the default
+             warmup = 2000,  # Adjust warmup period as necessary
+             chains = 4)  # Can increase chains if computational resources allow
+```
+
+```{r, warning=FALSE}
+library(ggplot2)
+library(bayesplot)
+pp_check(model3)+theme(panel.background = element_blank()) 
+#plot(model3,pars=as.character(names(fixef(model3))[-1]),prob = 0.5, prob_outer = 0.95)
+```
+
+This plot describes the convergence of the model, with the curve of the final model in dark blue, 10 iterations in thin lines. These lines demonstrate a good fit, indicating that the iterations align closely with the final model outcome. Binned residual plots for iterations(see appendix) also suggests fewer outliers.
+
+```{r, warning=FALSE}
+plot_model(model3,
+                   show.values=TRUE, show.p=TRUE,
+                   title="Effect of Demographic and Health-related Information on Timeliness")
+```
+
+(Baseline for Recommended Due Date Est = "pre-pandemic" Baseline for private insurance = "private" Baseline for Gender = "female" Baseline for Race = "white" Baseline for Languages = "English" Baseline for Lung RADS = "1 and 2" Baseline for comorbidity total = "0")
+
+In this Bayesian model, each variable has a baseline level encoded in intercept. As shown in the odds ratio plot, for different periods when radiology due date was recommended, the odds of being late during peak-pandemic is 9.50 times higher than that during pre-pandemic. Keeping other variables constant, the odds of being late during the post-peak pandemic is 1.42 times higher compared to pre-pandemic phase.
+
+For the category of Private Insurance, when compared to the baseline group of patients with Medicaid, those with Private Insurance have an odds ratio less than 1. This indicates that, keep other variables constant, patients with Medicare are 24% less likely to experience delays compared to those with Private Insurance. For patients' ages, the interpretation will slightly change: when the scaled age increases by 1 unit, they're 7% less likely to be late for follow-up CTLS. The results are consistent with those from the last model.
+
+# 6 Conclusion
+
+Our analysis revealed a significant decrease in timeliness of follow-up CTLS during the peak of the pandemic, with the odds of being late 9.50 times higher than in the pre-pandemic period. This trend persisted, though less pronounced, in the post-peak pandemic phase, indicating a long-term impact of the pandemic on screening schedules.
+
+Patient-related factors, such as comorbidity_total and Lung RADS, were significant predictors of screening timeliness. Interestingly, the study found that individuals with certain numbers comorbidities were more likely to attend screenings on time, suggesting a possible awareness or prioritization of lung health in these groups.
+
+Insurance type also influenced screening timeliness, with Medicare and Medicaid patients showing a lesser likelihood of delays compared to private insurance recipients. This disparity underscores the role of socioeconomic factors in healthcare access and adherence to recommended screenings.
+
+In conclusion, the pandemic has undeniably affected the follow-up rates and timeliness of CTLS, with significant variations across different patient demographics and conditions.
+
+# 7 Appendix
+
+Mixed-effect model with demographic information
+
+Model summary:
+
+```{r, warning=FALSE}
+summary(model)
+```
+
+Residual Plot:
+
+```{r, warning=FALSE}
+binnedplot(fitted(model), resid(model))
+```
+
+Mixed-effect model with demographic and health information
+
+Model summary:
+
+```{r, warning=FALSE}
+summary(model_health)
+```
+
+Residual Plot:
+
+```{r, warning=FALSE}
+binnedplot(fitted(model_health), resid(model_health,type="response"))
+```
+
+Last model in Bayesian approach
+
+Model summary:
+
+```{r, warning=FALSE}
+summary(model3)
+```
+
+Residual plot for 10 iterations
+
+```{r, warning=FALSE}
+pp_check(model3, type = "error_binned")
+```
